@@ -1,4 +1,4 @@
 aiogram==3.0.0b7  # Для Telegram-бота
 asyncpg==0.27.0   # Для работы с PostgreSQL
 sqlalchemy==2.0.0 # ORM для БД
-python-dotenv==1.0.0 # Для загрузки переменных окружения
+python-dotenv==1.0.0 # Для загрузки переменных окруженияpython-dotenv==1.0.0
