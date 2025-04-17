@@ -1,8 +1,21 @@
-from sqlalchemy import create_engine, Column, Integer, String, JSON, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, JSON, ForeignKey, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
+from datetime import datetime
 
 Base = declarative_base()
+
+class Order(Base):
+    __tablename__ = 'orders'
+    
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, nullable=False)  # Telegram user_id
+    product_id = Column(Integer, ForeignKey('products.id'))
+    quantity = Column(Integer, default=1)
+    order_date = Column(DateTime, default=datetime.utcnow)
+    status = Column(String(20), default='created')
+    
+    product = relationship("Product")
 
 class Category(Base):
     __tablename__ = 'categories'
