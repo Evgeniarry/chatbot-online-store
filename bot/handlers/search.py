@@ -1,19 +1,69 @@
-from aiogram import Router, types
+from aiogram import Router, types, F
 from aiogram.filters import Command
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.utils.markdown import hbold
-from markupsafe import escape
 from sqlalchemy import select, or_
-from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.orm import selectinload
 from bot.database.models import Product, Category
-from bot.database.session import engine
+from bot.database.session import AsyncSessionLocal
 
 router = Router(name="search_handlers")
-AsyncSession = async_sessionmaker(engine, expire_on_commit=False)
+
+async def perform_search(query: str, session) -> list[Product]:
+    """Выполняет поиск товаров по запросу"""
+    stmt = (
+        select(Product)
+        .join(Category)
+        .options(selectinload(Product.category))
+        .where(
+            or_(
+                Product.name.ilike(f"%{query}%"),
+                Product.article.ilike(f"%{query}%"),
+                Category.name.ilike(f"%{query}%")
+            )
+        )
+        .limit(10)
+    )
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+async def build_search_response(products: list[Product]) -> tuple[str, InlineKeyboardBuilder]:
+    """Формирует ответ с результатами поиска"""
+    if not products:
+        return "🔍 Товары не найдены", None
+
+    response = ["🔍 Результаты поиска:"]
+    for product in products:
+        response.append(
+            f"{hbold(product.name)} - {product.price} руб.\n"
+            f"Артикул: <code>{product.article}</code>\n"
+            f"Категория: {product.category.name}\n"
+        )
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 Назад в каталог", callback_data="catalog")
+    builder.button(text="🏠 В меню", callback_data="main_menu")
+    builder.adjust(1)
+
+    return "\n\n".join(response), builder
+
+@router.callback_query(F.data == "open_search")
+async def open_search_handler(callback: types.CallbackQuery):
+    """Активирует режим поиска из каталога"""
+    await callback.message.edit_text(
+        "🔍 Введите поисковый запрос:\n"
+        "Пример: <code>тарелка</code>\n"
+        "Или: <code>STK-001</code>\n\n"
+        "Просто напишите что ищете в этом чате",
+        parse_mode="HTML"
+    )
+    await callback.answer()
 
 @router.message(Command("search"))
-async def search_products(message: types.Message):
+async def search_command_handler(message: types.Message):
+    """Обрабатывает команду /search"""
     try:
-        query = escape(message.text.split(maxsplit=1)[1].strip())
+        query = message.text.split(maxsplit=1)[1].strip()
     except IndexError:
         await message.answer(
             "🔍 Введите поисковый запрос:\n"
@@ -22,45 +72,33 @@ async def search_products(message: types.Message):
             parse_mode="HTML"
         )
         return
+    
+    await process_search_query(message, query)
 
-    async with AsyncSession() as session:
-        try:
-            # Создаем асинхронную сессию
-            async with session.begin():
-                # Выполняем запрос
-                stmt = select(Product).join(Category).where(
-                    or_(
-                        Product.name.ilike(f"%{query}%"),
-                        Product.article.ilike(f"%{query}%"),
-                        Category.name.ilike(f"%{query}%")
-                    )
-                ).limit(10)
+@router.message(F.text & ~F.command)
+async def handle_text_search(message: types.Message):
+    """Обрабатывает текстовый поисковый запрос"""
+    query = message.text.strip()
+    if len(query) < 2:
+        await message.answer("Запрос должен содержать минимум 2 символа")
+        return
+    
+    await process_search_query(message, query)
 
-                result = await session.execute(stmt)
-                products = result.scalars().all()
-
-                if not products:
-                    await message.answer("🔍 Товары не найдены")
-                    return
-
-                # Формируем ответ
-                response = ["🔍 Результаты поиска:"]
-                for p in products:
-                    # Получаем категорию для каждого товара
-                    category = (await session.execute(
-                        select(Category).where(Category.id == p.category_id)
-                    )).scalar_one()
-                    
-                    response.append(
-                        f"{hbold(p.name)} - {p.price} руб.\n"
-                        f"Артикул: <code>{p.article}</code>\n"
-                        f"Категория: {category.name}\n"
-                    )
-
-                response_text = "\n\n".join(response).encode('utf-8').decode('utf-8')
-                await message.answer(response_text)
+async def process_search_query(message: types.Message, query: str):
+    """Общая функция обработки поискового запроса"""
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            try:
+                products = await perform_search(query, session)
+                text, reply_markup = await build_search_response(products)
                 
+                await message.answer(
+                    text,
+                    reply_markup=reply_markup.as_markup() if reply_markup else None,
+                    parse_mode="HTML"
+                )
 
-        except Exception as e:
-            await message.answer("⚠️ Ошибка при поиске товаров")
-            print(f"Search error: {e}")
+            except Exception as e:
+                await message.answer("⚠️ Ошибка при поиске товаров")
+                print(f"Search error: {type(e).__name__}: {e}")

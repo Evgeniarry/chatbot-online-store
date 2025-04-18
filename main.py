@@ -18,12 +18,6 @@ async def main():
     for router in routers:
         dp.include_router(router)
 
-    # Создание тестовых данных (если нужно)
-    if os.getenv("INIT_TEST_DATA"):
-        from bot.database.test_data import create_test_data
-        await create_test_data()
-        print("✅ Тестовые данные созданы")
-
     # Запускаем бота
     await dp.start_polling(bot)
 

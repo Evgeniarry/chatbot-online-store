@@ -1,83 +1,116 @@
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from typing import Dict, Any
+from aiogram import Router, types
 from aiogram import Router, types, F
-from aiogram.filters import Command
+from aiogram.utils.keyboard import InlineKeyboardBuilder, InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import select
-from sqlalchemy.orm import selectinload
-from sqlalchemy.ext.asyncio import AsyncSession
-from bot.database.models import Product, Order
-from bot.database.session import AsyncSessionLocal  # Используем исправленную фабрику сессий
+from bot.database.session import AsyncSessionLocal
+from bot.database.models import Order
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload 
 
-router = Router(name="order_handlers")
+router = Router()
 
-@router.message(Command("order"))
-async def order_product(message: types.Message):
-    try:
-        article = message.text.split(maxsplit=1)[1].strip().upper()
-    except IndexError:
-        await message.answer(
-            "ℹ️ Usage: /order <ARTICLE>\n"
-            "Example: /order STK-001"
-        )
+# Состояния для пагинации
+class Pagination(StatesGroup):
+    orders_page = State()
+
+# Храним состояние пагинации для каждого пользователя
+user_orders_state: Dict[int, Dict[str, Any]] = {}
+
+@router.callback_query(F.data == "order_history")
+async def handle_order_history(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    
+    # Инициализация состояния
+    user_orders_state[user_id] = {
+        "page": 0,
+        "orders": [],
+        "message_id": None
+    }
+    
+    await show_orders_page(callback.message, user_id)
+    await callback.answer()
+
+async def show_orders_page(message: types.Message, user_id: int):
+    state = user_orders_state.get(user_id)
+    if not state:
         return
-
+    
+    page = state["page"]
+    items_per_page = 5  # Количество заказов на странице
+    
     async with AsyncSessionLocal() as session:
-        # Находим товар по артикулу
-        product = await session.execute(
-            select(Product).where(Product.article == article))
-        product = product.scalar_one_or_none()
-
-        if not product:
-            await message.answer(f"❌ Product with article {article} not found")
-            return
-
-        # Создаем заказ
-        new_order = Order(
-            user_id=message.from_user.id,
-            product_id=product.id,
-            quantity=1,
-            status='created'
-        )
-        session.add(new_order)
-        await session.commit()
-
-        await message.answer(
-            f"✅ Order created!\n"
-            f"Product: {product.name}\n"
-            f"Price: {product.price} RUB\n"
-            f"Order #: {new_order.id}"
-        )
-
-@router.message(Command("history"))
-async def order_history(message: types.Message):
-    # Создаем новую сессию с явной привязкой
-    async with AsyncSessionLocal() as session:
-        try:
-            # Явно начинаем транзакцию
-            async with session.begin():
-                # Загружаем заказы с связанными продуктами
+        async with session.begin():
+            # Загружаем заказы только при первом открытии
+            if not state["orders"]:
                 result = await session.execute(
                     select(Order)
-                    .where(Order.user_id == message.from_user.id)
+                    .where(Order.user_id == user_id)
                     .order_by(Order.order_date.desc())
-                    .limit(10)
-                    .options(selectinload(Order.product))  # Жадная загрузка продукта
+                    .options(selectinload(Order.product))
                 )
-                orders = result.scalars().all()
-
-                if not orders:
-                    await message.answer("📭 You have no orders yet")
-                    return
-
-                response = ["📋 Your last orders:"]
-                for order in orders:
+                state["orders"] = result.scalars().all()
+            
+            orders = state["orders"]
+            total_pages = (len(orders) + items_per_page - 1) // items_per_page
+            
+            # Получаем заказы для текущей страницы
+            page_orders = orders[page*items_per_page : (page+1)*items_per_page]
+            
+            if not page_orders:
+                text = "📭 У вас пока нет заказов"
+                keyboard = None
+            else:
+                response = [f"📋 Ваши заказы (страница {page+1}/{total_pages}):"]
+                for order in page_orders:
                     response.append(
                         f"🆔 #{order.id} {order.product.name}\n"
                         f"💰 {order.product.price} RUB\n"
                         f"📅 {order.order_date.strftime('%Y-%m-%d %H:%M')}\n"
-                        f"🔹 Status: {order.status}"
+                        f"🔹 Статус: {order.status}\n"
                     )
-
-                await message.answer("\n\n".join(response))
+                text = "\n\n".join(response)
                 
-        except Exception as e:
-            await message.answer("⚠️ Error loading order history")
-            print(f"History error: {e}")
+                # Создаем клавиатуру с пагинацией
+                builder = InlineKeyboardBuilder()
+                
+                if page > 0:
+                    builder.button(text="⬅ Назад", callback_data="orders_prev_page")
+                
+                if page < total_pages - 1:
+                    builder.button(text="Вперед ➡", callback_data="orders_next_page")
+                
+                builder.button(text="🏠 В меню", callback_data="main_menu")
+                builder.adjust(2)
+                
+                keyboard = builder.as_markup()
+            
+            # Отправляем или редактируем сообщение
+            if state["message_id"]:
+                await message.bot.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=state["message_id"],
+                    text=text,
+                    reply_markup=keyboard
+                )
+            else:
+                msg = await message.answer(text, reply_markup=keyboard)
+                state["message_id"] = msg.message_id
+
+@router.callback_query(F.data == "orders_prev_page")
+async def prev_page(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    if user_id in user_orders_state:
+        user_orders_state[user_id]["page"] -= 1
+        await show_orders_page(callback.message, user_id)
+    await callback.answer()
+
+@router.callback_query(F.data == "orders_next_page")
+async def next_page(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    if user_id in user_orders_state:
+        user_orders_state[user_id]["page"] += 1
+        await show_orders_page(callback.message, user_id)
+    await callback.answer()
